@@ -6,6 +6,7 @@ project(ProtectThing)
 set(CMAKE_CXX_STANDARD 26)
 
 find_package(Boost 1.89.0 REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 
 add_library(cJSON third_party/cJSON/cJSON.c)
@@ -19,5 +20,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE include)
 target_link_libraries(${PROJECT_NAME} PRIVATE
         cJSON
         Boost::boost
+        OpenSSL::SSL
+        OpenSSL::Crypto
         CURL::libcurl
 )

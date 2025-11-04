@@ -1,7 +1,7 @@
 {
   "name": "another_demo_service",
   "protocol": "http",
-  "hostname": "http://example.com",
-  "port": 80,
-  "portal:bind": "127.0.0.1:9502"
+  "hostname": "https://cirkl.ai",
+  "port": 443,
+  "portal:bind": "127.0.0.1:9501"
 }

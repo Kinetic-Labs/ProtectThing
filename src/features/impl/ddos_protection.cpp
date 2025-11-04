@@ -4,15 +4,17 @@
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/asio/ssl.hpp>
+#include <openssl/ssl.h>
 
 #include "config/impl/config_parser.h"
 #include "util/impl/logger.h"
-#include "util/impl/misc.h"
 #include "util/impl/misc.h"
 
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
+namespace ssl = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
 const std::string error_connect_message =
@@ -27,8 +29,15 @@ int DDoSProtection::start_server(const ConfigParser::ProtectThingConfig& config,
     const std::string target_host = Misc::get_hostname_from_url(config.hostname);
     short target_port = config.port;
 
+    bool use_tls = config.hostname.rfind("https://", 0) == 0;
+    if (use_tls && target_port == 80) {
+        target_port = 443;
+    }
+
     try {
         net::io_context io_context;
+        ssl::context ssl_context(ssl::context::tlsv12_client);
+        ssl_context.set_verify_mode(ssl::verify_none);
         tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), port));
 
         Logger::info(std::format("{} running on http://{}", portal_name, config.portal_bind), guard_log_name);
@@ -83,58 +92,117 @@ int DDoSProtection::start_server(const ConfigParser::ProtectThingConfig& config,
                 continue;
             }
 
-            tcp::socket target_socket(io_context);
-            net::connect(target_socket, results.begin(), results.end(), error_code);
+            if (use_tls) {
+                ssl::stream<tcp::socket> target_socket(io_context, ssl_context);
+                net::connect(target_socket.next_layer(), results.begin(), results.end(), error_code);
+                if (error_code) {
+                    Logger::error(std::format("Failed to connect to target (TLS): {}", error_code.message()), portal_log_name);
+                    http::response<http::string_body> error_res{http::status::bad_gateway, req.version()};
+                    error_res.set(http::field::server, portal_log_name);
+                    error_res.set(http::field::content_type, "text/plain");
+                    error_res.body() = error_connect_message;
+                    error_res.prepare_payload();
+                    http::write(client_socket, error_res, error_code);
+                    client_socket.close();
+                    continue;
+                }
 
-            if(error_code) {
-                Logger::error(std::format("Failed to connect to target: {}", error_code.message()), portal_log_name);
+                SSL_set_tlsext_host_name(target_socket.native_handle(), target_host.c_str());
 
-                http::response<http::string_body> error_res{http::status::bad_gateway, req.version()};
-                error_res.set(http::field::server, portal_log_name);
-                error_res.set(http::field::content_type, "text/plain");
-                error_res.body() = error_connect_message;
-                error_res.prepare_payload();
-                http::write(client_socket, error_res, error_code);
+                target_socket.handshake(ssl::stream_base::client, error_code);
+                if (error_code) {
+                    Logger::error(std::format("Failed to perform SSL handshake: {}", error_code.message()), portal_log_name);
+                    http::response<http::string_body> error_res{http::status::bad_gateway, req.version()};
+                    error_res.set(http::field::server, portal_log_name);
+                    error_res.set(http::field::content_type, "text/plain");
+                    error_res.body() = error_connect_message;
+                    error_res.prepare_payload();
+                    http::write(client_socket, error_res, error_code);
+                    client_socket.close();
+                    continue;
+                }
+                req.set(http::field::host, std::format("{}:{}", target_host, target_port));
+                http::write(target_socket, req, error_code);
+                if (error_code) {
+                    Logger::error(std::format("Error writing to target (TLS): {}", error_code.message()), portal_log_name);
+                    target_socket.shutdown(error_code);
+                    target_socket.next_layer().close();
+                    client_socket.close();
+                    continue;
+                }
+                beast::flat_buffer response_buffer;
+                http::response<http::dynamic_body> res;
+                http::response_parser<http::dynamic_body> response_parser;
+                response_parser.body_limit(100ULL * 1024 * 1024 * 1024);
+                http::read(target_socket, response_buffer, response_parser, error_code);
+                if (!error_code)
+                    res = response_parser.release();
+                if (error_code) {
+                    Logger::error(std::format("Error reading from target (TLS): {}", error_code.message()), portal_log_name);
+                    target_socket.shutdown(error_code);
+                    target_socket.next_layer().close();
+                    client_socket.close();
+                    continue;
+                }
+                http::write(client_socket, res, error_code);
+                if (error_code)
+                    Logger::error(std::format("Error writing to client: {}", error_code.message()), portal_log_name);
+                target_socket.shutdown(error_code);
+                target_socket.next_layer().close();
+            } else {
+                tcp::socket target_socket(io_context);
+                net::connect(target_socket, results.begin(), results.end(), error_code);
 
-                client_socket.close();
-                continue;
-            }
+                if(error_code) {
+                    Logger::error(std::format("Failed to connect to target: {}", error_code.message()), portal_log_name);
 
-            req.set(http::field::host, std::format("{}:{}", target_host, target_port));
+                    http::response<http::string_body> error_res{http::status::bad_gateway, req.version()};
+                    error_res.set(http::field::server, portal_log_name);
+                    error_res.set(http::field::content_type, "text/plain");
+                    error_res.body() = error_connect_message;
+                    error_res.prepare_payload();
+                    http::write(client_socket, error_res, error_code);
 
-            http::write(target_socket, req, error_code);
-            if(error_code) {
-                Logger::error(std::format("Error writing to target: {}", error_code.message()), portal_log_name);
+                    client_socket.close();
+                    continue;
+                }
+
+                req.set(http::field::host, std::format("{}:{}", target_host, target_port));
+
+                http::write(target_socket, req, error_code);
+                if(error_code) {
+                    Logger::error(std::format("Error writing to target: {}", error_code.message()), portal_log_name);
+                    target_socket.close();
+                    client_socket.close();
+                    continue;
+                }
+
+                beast::flat_buffer response_buffer;
+                http::response<http::dynamic_body> res;
+
+                http::response_parser<http::dynamic_body> response_parser;
+                response_parser.body_limit(100ULL * 1024 * 1024 * 1024);
+
+                http::read(target_socket, response_buffer, response_parser, error_code);
+                if(!error_code)
+                    res = response_parser.release();
+
+                if(error_code) {
+                    Logger::error(std::format("Error reading from target: {}", error_code.message()), portal_log_name);
+                    target_socket.close();
+                    client_socket.close();
+                    continue;
+                }
+
+                http::write(client_socket, res, error_code);
+                if(error_code)
+                    Logger::error(std::format("Error writing to client: {}", error_code.message()), portal_log_name);
+
+                error_code = target_socket.shutdown(tcp::socket::shutdown_both, error_code);
+                if(error_code)
+                    continue;
                 target_socket.close();
-                client_socket.close();
-                continue;
             }
-
-            beast::flat_buffer response_buffer;
-            http::response<http::dynamic_body> res;
-
-            http::response_parser<http::dynamic_body> response_parser;
-            response_parser.body_limit(100ULL * 1024 * 1024 * 1024);
-
-            http::read(target_socket, response_buffer, response_parser, error_code);
-            if(!error_code)
-                res = response_parser.release();
-
-            if(error_code) {
-                Logger::error(std::format("Error reading from target: {}", error_code.message()), portal_log_name);
-                target_socket.close();
-                client_socket.close();
-                continue;
-            }
-
-            http::write(client_socket, res, error_code);
-            if(error_code)
-                Logger::error(std::format("Error writing to client: {}", error_code.message()), portal_log_name);
-
-            error_code = target_socket.shutdown(tcp::socket::shutdown_both, error_code);
-            if(error_code)
-                continue;
-            target_socket.close();
 
             error_code = client_socket.shutdown(tcp::socket::shutdown_both, error_code);
             if(error_code)
