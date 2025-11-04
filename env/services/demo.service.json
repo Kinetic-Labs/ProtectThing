@@ -3,5 +3,14 @@
   "protocol": "http",
   "hostname": "http://127.0.0.1",
   "port": 8000,
-  "portal:bind": "127.0.0.1:9502"
+  "portal:bind": "127.0.0.1:9502",
+  "rate_limit": {
+    "requests_per_minute": 100,
+    "block_duration_seconds": 60
+  },
+  "pattern_protection": {
+    "enabled": true,
+    "path_request_limit": 20,
+    "path_time_window_seconds": 10
+  }
 }

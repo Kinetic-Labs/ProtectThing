@@ -37,6 +37,36 @@ ConfigParser::ProtectThingConfig ConfigParser::parse_config(const std::string& p
         config.hostname = hostname_str;
         config.portal_bind = portal_bind_str;
         config.port = port_short;
+
+        const cJSON* p_rate_limit = cJSON_GetObjectItemCaseSensitive(p_json, "rate_limit");
+        if (p_rate_limit) {
+            const cJSON* p_requests_per_minute = cJSON_GetObjectItemCaseSensitive(p_rate_limit, "requests_per_minute");
+            const cJSON* p_block_duration_seconds = cJSON_GetObjectItemCaseSensitive(p_rate_limit, "block_duration_seconds");
+
+            if (p_requests_per_minute) {
+                config.rate_limit.requests_per_minute = p_requests_per_minute->valueint;
+            }
+            if (p_block_duration_seconds) {
+                config.rate_limit.block_duration_seconds = p_block_duration_seconds->valueint;
+            }
+        }
+
+        const cJSON* p_pattern_protection = cJSON_GetObjectItemCaseSensitive(p_json, "pattern_protection");
+        if (p_pattern_protection) {
+            const cJSON* p_enabled = cJSON_GetObjectItemCaseSensitive(p_pattern_protection, "enabled");
+            const cJSON* p_path_request_limit = cJSON_GetObjectItemCaseSensitive(p_pattern_protection, "path_request_limit");
+            const cJSON* p_path_time_window_seconds = cJSON_GetObjectItemCaseSensitive(p_pattern_protection, "path_time_window_seconds");
+
+            if (p_enabled) {
+                config.pattern_protection.enabled = cJSON_IsTrue(p_enabled);
+            }
+            if (p_path_request_limit) {
+                config.pattern_protection.path_request_limit = p_path_request_limit->valueint;
+            }
+            if (p_path_time_window_seconds) {
+                config.pattern_protection.path_time_window_seconds = p_path_time_window_seconds->valueint;
+            }
+        }
     } catch(const std::exception &exception) {
         Logger::error(exception.what(), "ConfigParser");
         cJSON_Delete(p_json);

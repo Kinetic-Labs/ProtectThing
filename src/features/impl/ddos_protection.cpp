@@ -1,6 +1,10 @@
 #include "features/impl/ddos_protection.h"
+#include "features/impl/ddos_protection_web.h"
 
 #include <string>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -34,6 +38,15 @@ int DDoSProtection::start_server(const ConfigParser::ProtectThingConfig& config,
         target_port = 443;
     }
 
+    struct RateLimitInfo {
+        int count;
+        std::chrono::steady_clock::time_point window_start;
+    };
+
+    static std::unordered_map<std::string, RateLimitInfo> ip_requests;
+    static std::unordered_map<std::string, std::chrono::steady_clock::time_point> blocked_ips;
+    static std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::chrono::steady_clock::time_point>>> ip_path_requests;
+
     try {
         net::io_context io_context;
         ssl::context ssl_context(ssl::context::tlsv12_client);
@@ -51,10 +64,49 @@ int DDoSProtection::start_server(const ConfigParser::ProtectThingConfig& config,
             auto remote_endpoint = client_socket.remote_endpoint(error_code);
 
             if(!error_code) {
-                unsigned short client_port = 0;
                 std::string client_ip = remote_endpoint.address().to_string();
-                client_port = remote_endpoint.port();
-                Logger::info(std::format("Client connected: [IP: {}:{}]", client_ip, client_port), guard_log_name);
+                Logger::info(std::format("Client connected: [IP: {}:{}]", client_ip, remote_endpoint.port()), guard_log_name);
+
+                auto blocked_it = blocked_ips.find(client_ip);
+                if (blocked_it != blocked_ips.end()) {
+                    if (std::chrono::steady_clock::now() < blocked_it->second) {
+                        http::response<http::string_body> res{http::status::too_many_requests, 11};
+                        res.set(http::field::server, portal_log_name);
+                        res.set(http::field::content_type, "text/html");
+                        res.body() = error_page_html;
+                        res.prepare_payload();
+                        http::write(client_socket, res, error_code);
+                        client_socket.close();
+                        continue;
+                    } else {
+                        blocked_ips.erase(blocked_it);
+                        ip_requests.erase(client_ip);
+                    }
+                }
+
+                auto& info = ip_requests[client_ip];
+                auto now = std::chrono::steady_clock::now();
+
+                if (info.count == 0 || (now - info.window_start) > std::chrono::minutes(1)) {
+                    info.count = 1;
+                    info.window_start = now;
+                } else {
+                    info.count++;
+                }
+
+                if (info.count > config.rate_limit.requests_per_minute) {
+                    Logger::warning(std::format("Rate limit exceeded for IP: {}. Blocking for {} seconds.", client_ip, config.rate_limit.block_duration_seconds), guard_log_name);
+                    blocked_ips[client_ip] = now + std::chrono::seconds(config.rate_limit.block_duration_seconds);
+
+                    http::response<http::string_body> res{http::status::too_many_requests, 11};
+                    res.set(http::field::server, portal_log_name);
+                    res.set(http::field::content_type, "text/html");
+                    res.body() = error_page_html;
+                    res.prepare_payload();
+                    http::write(client_socket, res, error_code);
+                    client_socket.close();
+                    continue;
+                }
             } else {
                 Logger::error(std::format("Failed to get remote endpoint: {}", error_code.message()), guard_log_name);
             }
@@ -68,6 +120,34 @@ int DDoSProtection::start_server(const ConfigParser::ProtectThingConfig& config,
             http::read(client_socket, buffer, parser, error_code);
             if(!error_code)
                 req = parser.release();
+
+            if (config.pattern_protection.enabled && !error_code) {
+                std::string client_ip = remote_endpoint.address().to_string();
+                std::string path = std::string(req.target());
+                auto now = std::chrono::steady_clock::now();
+
+                auto& path_requests = ip_path_requests[client_ip][path];
+                path_requests.push_back(now);
+
+                auto it = std::remove_if(path_requests.begin(), path_requests.end(), [&](const auto& time_point) {
+                    return (now - time_point) > std::chrono::seconds(config.pattern_protection.path_time_window_seconds);
+                });
+                path_requests.erase(it, path_requests.end());
+
+                if (path_requests.size() > static_cast<size_t>(config.pattern_protection.path_request_limit)) {
+                    Logger::warning(std::format("Pattern protection triggered for IP: {} on path: {}. Blocking for {} seconds.", client_ip, path, config.rate_limit.block_duration_seconds), guard_log_name);
+                    blocked_ips[client_ip] = now + std::chrono::seconds(config.rate_limit.block_duration_seconds);
+
+                    http::response<http::string_body> res{http::status::too_many_requests, 11};
+                    res.set(http::field::server, portal_log_name);
+                    res.set(http::field::content_type, "text/html");
+                    res.body() = error_page_html;
+                    res.prepare_payload();
+                    http::write(client_socket, res, error_code);
+                    client_socket.close();
+                    continue;
+                }
+            }
 
             if(error_code) {
                 Logger::error(std::format("Error reading client request: {}", error_code.message()), guard_log_name);
